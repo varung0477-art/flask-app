@@ -1,0 +1,105 @@
+name: Build and Deploy
+
+on:
+  push:
+    branches: [main]
+    paths: ["app/**", ".github/workflows/deploy.yml"]
+  workflow_dispatch: # manual trigger from the Actions tab
+
+permissions:
+  contents: read
+  id-token: write # only used if you choose OIDC (AWS_ROLE_ARN)
+
+concurrency:
+  group: deploy
+  cancel-in-progress: false
+
+env:
+  # Optional repository *variables* (Settings > Secrets and variables > Actions > Variables)
+  AWS_REGION: ${{ vars.AWS_REGION || 'us-east-1' }}
+  PROJECT_NAME: ${{ vars.PROJECT_NAME || 'devops-challenge' }}
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # Option A (default): static keys stored as repository secrets
+      - name: Configure AWS credentials (access keys)
+        if: ${{ vars.AWS_ROLE_ARN == '' }}
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-session-token: ${{ secrets.AWS_SESSION_TOKEN }} # optional
+          aws-region: ${{ env.AWS_REGION }}
+
+      # Option B: OIDC role (set repository variable AWS_ROLE_ARN)
+      - name: Configure AWS credentials (OIDC)
+        if: ${{ vars.AWS_ROLE_ARN != '' }}
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Login to ECR
+        id: ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Build and push image
+        id: build
+        run: |
+          IMAGE="${{ steps.ecr.outputs.registry }}/${PROJECT_NAME}"
+          docker build -t "$IMAGE:${GITHUB_SHA}" -t "$IMAGE:latest" app/
+          docker push "$IMAGE:${GITHUB_SHA}"
+          docker push "$IMAGE:latest"
+          echo "uri=$IMAGE:${GITHUB_SHA}" >> "$GITHUB_OUTPUT"
+
+      - name: Find target instance
+        id: instance
+        run: |
+          ID=$(aws ec2 describe-instances \
+            --filters "Name=tag:Name,Values=${PROJECT_NAME}" "Name=instance-state-name,Values=running" \
+            --query 'Reservations[0].Instances[0].InstanceId' --output text)
+          if [ -z "$ID" ] || [ "$ID" = "None" ]; then
+            echo "::error::No running instance tagged Name=${PROJECT_NAME}. Did you run terraform apply (same region/project_name)?"
+            exit 1
+          fi
+          echo "id=$ID" >> "$GITHUB_OUTPUT"
+
+      - name: Wait for SSM agent to be online
+        run: |
+          for i in $(seq 1 30); do
+            STATUS=$(aws ssm describe-instance-information \
+              --filters "Key=InstanceIds,Values=${{ steps.instance.outputs.id }}" \
+              --query 'InstanceInformationList[0].PingStatus' --output text)
+            echo "SSM status: $STATUS"
+            [ "$STATUS" = "Online" ] && exit 0
+            sleep 10
+          done
+          echo "::error::Instance never registered with SSM"; exit 1
+
+      - name: Deploy via SSM Run Command
+        run: |
+          CMD_ID=$(aws ssm send-command \
+            --instance-ids "${{ steps.instance.outputs.id }}" \
+            --document-name AWS-RunShellScript \
+            --comment "deploy ${GITHUB_SHA}" \
+            --parameters "commands=[\"/usr/local/bin/app-deploy.sh ${{ steps.build.outputs.uri }}\"]" \
+            --query 'Command.CommandId' --output text)
+          aws ssm wait command-executed --command-id "$CMD_ID" --instance-id "${{ steps.instance.outputs.id }}" || true
+          aws ssm get-command-invocation --command-id "$CMD_ID" --instance-id "${{ steps.instance.outputs.id }}" \
+            --query '[Status,StandardOutputContent,StandardErrorContent]' --output text
+          STATUS=$(aws ssm get-command-invocation --command-id "$CMD_ID" --instance-id "${{ steps.instance.outputs.id }}" --query Status --output text)
+          [ "$STATUS" = "Success" ]
+
+      - name: Verify through the load balancer
+        run: |
+          DNS=$(aws elbv2 describe-load-balancers --names "${PROJECT_NAME}-alb" \
+            --query 'LoadBalancers[0].DNSName' --output text)
+          for i in $(seq 1 30); do
+            if curl -fsS "http://$DNS/info"; then echo; echo "Healthy: http://$DNS/info"; exit 0; fi
+            sleep 10
+          done
+          echo "::error::ALB did not return 200 from /info"; exit 1

@@ -1,0 +1,5 @@
+aws_region       = "us-east-1"
+project_name     = "devops-challenge"
+ssh_allowed_cidr = "203.0.113.7/32" # your public IP
+# aws_profile    = "my-profile"
+# ssh_key_name   = "my-keypair"

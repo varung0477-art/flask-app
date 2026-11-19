@@ -1,0 +1,68 @@
+#!/bin/bash
+# Runs once at first boot. NOTE: do not use curly-brace shell expansions below (Terraform template syntax).
+set -euxo pipefail
+exec > >(tee /var/log/user-data.log) 2>&1
+
+dnf install -y docker
+systemctl enable --now docker
+
+mkdir -p /etc/app
+echo "${default_image}" > /etc/app/image
+
+# Log in to ECR (instance role) and pull the image named in /etc/app/image
+cat > /usr/local/bin/app-pull.sh <<'EOS'
+#!/bin/bash
+set -euo pipefail
+IMAGE=$(cat /etc/app/image)
+REGISTRY=$(echo "$IMAGE" | cut -d/ -f1)
+REGION=$(echo "$REGISTRY" | cut -d. -f4)
+aws ecr get-login-password --region "$REGION" | docker login --username AWS --password-stdin "$REGISTRY"
+docker pull "$IMAGE"
+EOS
+
+cat > /usr/local/bin/app-run.sh <<'EOS'
+#!/bin/bash
+set -euo pipefail
+exec docker run --rm --name app -e APP_ENV=production -e PORT=5000 -p 5000:5000 "$(cat /etc/app/image)"
+EOS
+
+# Called by CI/CD (via SSM): app-deploy.sh <full-image-uri>
+cat > /usr/local/bin/app-deploy.sh <<'EOS'
+#!/bin/bash
+set -euo pipefail
+echo "$1" > /etc/app/image
+systemctl restart app.service
+for i in $(seq 1 30); do
+  if curl -fsS http://localhost:5000/info; then echo; echo "deploy OK: $1"; exit 0; fi
+  sleep 2
+done
+echo "app did not become healthy" >&2
+journalctl -u app.service --no-pager -n 50 >&2 || true
+exit 1
+EOS
+
+chmod +x /usr/local/bin/app-*.sh
+
+# Runs the container on every boot; retries until an image exists in ECR
+cat > /etc/systemd/system/app.service <<'EOS'
+[Unit]
+Description=Flask app container
+After=docker.service network-online.target
+Requires=docker.service
+
+[Service]
+Environment=HOME=/root
+TimeoutStartSec=300
+Restart=always
+RestartSec=20
+ExecStartPre=-/usr/bin/docker rm -f app
+ExecStartPre=/usr/local/bin/app-pull.sh
+ExecStart=/usr/local/bin/app-run.sh
+ExecStop=/usr/bin/docker stop app
+
+[Install]
+WantedBy=multi-user.target
+EOS
+
+systemctl daemon-reload
+systemctl enable --now app.service || true
