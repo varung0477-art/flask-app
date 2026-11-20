@@ -1,0 +1,3 @@
+# Copy to backend.hcl (git-ignored) or generate it with ./scripts/bootstrap-state-bucket.sh
+bucket = "devops-challenge-tfstate-123456789012"
+region = "us-east-1"

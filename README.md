@@ -14,6 +14,7 @@ GitHub Actions ─▶ build ─▶ ECR ─▶ SSM Run Command ─▶ instance pu
 | `.github/workflows/deploy.yml` | Build → push to ECR → deploy via SSM → verify through ALB |
 | `app/` | Flask app + Dockerfile (see "Changes to the provided app") |
 | `scripts/deploy.sh` | Same deploy, runnable from your laptop |
+| `scripts/bootstrap-state-bucket.sh` | One-time: creates the S3 bucket for Terraform state and writes `terraform/backend.hcl` |
 | `scripts/setup-github-secrets.sh` | Creates the GitHub Actions secrets/variables from your `.env` |
 | `.env.example` | Template for every environment variable (copy to `.env`, which is git-ignored) |
 | `docker-compose.yml` | Run the app locally |
@@ -50,11 +51,12 @@ App environment variables:
    Or by hand: repo **Settings → Secrets and variables → Actions** → add the same names.
 
 ### Full deploy order
-1. `cd terraform && cp terraform.tfvars.example terraform.tfvars && terraform init && terraform apply`
-2. `./scripts/setup-github-secrets.sh`
-3. GitHub → **Actions → Build and Deploy → Run workflow** (or push to `main`)
-4. `curl "$(terraform -chdir=terraform output -raw info_url)"`
-5. When finished: `terraform -chdir=terraform destroy`
+1. `./scripts/bootstrap-state-bucket.sh` (once per AWS account: creates the S3 state bucket)
+2. `cd terraform && cp terraform.tfvars.example terraform.tfvars && terraform init -backend-config=backend.hcl && terraform apply`
+3. `./scripts/setup-github-secrets.sh`
+4. GitHub → **Actions → Build and Deploy → Run workflow** (or push to `main`)
+5. `curl "$(terraform -chdir=terraform output -raw info_url)"`
+6. When finished: `terraform -chdir=terraform destroy`
 
 ## Prerequisites
 Terraform >= 1.5, AWS CLI v2, Docker (only for manual deploys), an AWS account (Free Tier is fine), and a GitHub repo containing this code.
@@ -82,12 +84,17 @@ The CI identity needs roughly: `ecr:*` push actions on the repo + `ecr:GetAuthor
 
 ## 2. Deploy the infrastructure
 
+Terraform state is stored remotely in **S3** (`terraform/backend.tf`), not on your machine: encrypted, versioned, private, with S3-native locking (`use_lockfile`) so two people can't apply at once. The bucket name is not hard-coded; it's passed at init time from `terraform/backend.hcl` (git-ignored).
+
 ```bash
+./scripts/bootstrap-state-bucket.sh            # once per account: creates <project_name>-tfstate-<account-id> + terraform/backend.hcl
 cd terraform
 cp terraform.tfvars.example terraform.tfvars   # set ssh_allowed_cidr to your IP/32
-terraform init
+terraform init -backend-config=backend.hcl
 terraform apply
 ```
+
+To use your own existing bucket instead, copy `backend.hcl.example` to `backend.hcl` and edit it (or set `TF_STATE_BUCKET` before running the bootstrap script).
 
 Outputs include `info_url`. The instance boots, installs Docker and starts a systemd service that keeps trying to pull `:latest` from ECR. Until the first image is pushed the ALB returns 502/503, which is expected.
 
@@ -112,6 +119,14 @@ cd terraform && terraform destroy
 ```
 (ECR has `force_delete = true`, so images are removed too.)
 
+The state bucket is not managed by Terraform, so it survives `destroy`. To remove it as well (only when you no longer need the state):
+
+```bash
+BUCKET=$(grep bucket terraform/backend.hcl | cut -d'"' -f2)
+aws s3api delete-objects --bucket "$BUCKET" --delete "$(aws s3api list-object-versions --bucket "$BUCKET" --query '{Objects: [Versions, DeleteMarkers][][].{Key: Key, VersionId: VersionId}}' --output json)"
+aws s3api delete-bucket --bucket "$BUCKET"
+```
+
 ## Security design
 * ALB SG: inbound 80 from the internet; outbound only to the instance SG on 5000.
 * Instance SG: 5000 **only from the ALB SG**; 22 only from `ssh_allowed_cidr` (default `1.2.3.4/32`, so change it if you want SSH).
@@ -126,8 +141,8 @@ cd terraform && terraform destroy
 * Region has a **default VPC** (or pass `vpc_id` with ≥2 public subnets in different AZs). No NAT gateway is used, so the instance sits in a public subnet with a public IP (its SG still blocks everything except ALB/SSH).
 * HTTP only on port 80; no domain/TLS.
 * Single instance (no auto scaling), so a deploy has a few seconds of downtime while the container restarts.
-* Terraform state is local. The `Name` tag and ECR repo name both equal `project_name`, which is how the pipeline finds its targets.
+* Terraform state lives in an S3 bucket you create once with `scripts/bootstrap-state-bucket.sh` (Terraform can't create the bucket that stores its own state). The `Name` tag and ECR repo name both equal `project_name`, which is how the pipeline finds its targets.
 * Terraform and the pipeline use the same account and region.
 
 ## Production improvements
-Remote state (S3 + locking); HTTPS with ACM + 301 redirect; ASG with ≥2 instances across AZs and rolling/instance-refresh deploys; private subnets with VPC endpoints (ECR, SSM, S3) or NAT; OIDC with a scoped CI role; immutable image tags (no `latest`) with Trivy scanning in CI; gunicorn instead of Flask's dev server; WAF; CloudWatch logs/alarms; tests and `terraform fmt/validate/tflint` in CI; Terraform changes via PR plan/apply workflow.
+HTTPS with ACM + 301 redirect; ASG with ≥2 instances across AZs and rolling/instance-refresh deploys; private subnets with VPC endpoints (ECR, SSM, S3) or NAT; OIDC with a scoped CI role; immutable image tags (no `latest`) with Trivy scanning in CI; gunicorn instead of Flask's dev server; WAF; CloudWatch logs/alarms; tests and `terraform fmt/validate/tflint` in CI; Terraform changes via PR plan/apply workflow.

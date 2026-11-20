@@ -2,6 +2,7 @@
 *.tfstate
 *.tfstate.*
 *.tfvars
+backend.hcl
 !*.tfvars.example
 crash.log
 .env
